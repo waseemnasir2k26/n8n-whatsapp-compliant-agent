@@ -1,0 +1,123 @@
+# n8n-whatsapp-compliant-agent :: limits configuration (example)
+#
+# Copy to config/limits.yaml and edit. config/limits.yaml is gitignored because
+# it names your real phone numbers.
+#
+# Nothing here is a phone number, token or WABA id you can use - every value is
+# invented. Replace them all.
+
+business:
+  # Your Cloud API phone_number_id, NOT the phone number itself.
+  phone_number_id: "000000000000001"
+  # Your WhatsApp Business Account id.
+  waba_id: "000000000000002"
+  # The name people opted in to receive messages from. Meta requires the opt-in
+  # to state the business name.
+  # https://developers.facebook.com/documentation/business-messaging/whatsapp/getting-opt-in
+  display_name: "Example Widgets Ltd"
+  graph_api_version: "v21.0"
+
+messaging_limits:
+  # VERIFIED: Meta's messaging limit tiers are expressed as the number of UNIQUE
+  # customers you can start a conversation with in a rolling 24 hours:
+  # 250 (default for new portfolios) / 2,000 / 10,000 / 100,000 / unlimited.
+  # https://developers.facebook.com/documentation/business-messaging/whatsapp/messaging-limits
+  #
+  # Set this to the tier Meta has actually granted you. Do not aspirationally
+  # set a higher tier - this kit uses it as a ceiling, not a target.
+  tier: 250
+
+  # Your own cap, applied on top of Meta's tier. Keep it well under the tier so
+  # you never brush the platform limit. This kit caps at the LOWER of the two.
+  self_imposed_daily_unique_recipients: 150
+
+  # Total outbound messages per 24h for this number, including replies inside an
+  # open window (which do NOT count toward Meta's tier, but do count toward how
+  # spammy you look).
+  self_imposed_daily_total_messages: 800
+
+burst:
+  # UNVERIFIED as a Meta-published number: Meta documents a throughput concept
+  # for Cloud API but this kit does not encode a specific messages-per-second
+  # figure from the docs. These are conservative self-imposed values.
+  window_seconds: 60
+  max_messages_per_window: 20
+  # Minimum gap between two outbound messages to the SAME contact.
+  min_seconds_between_messages_per_contact: 15
+
+window:
+  # VERIFIED: 24 hours, reset by every inbound user message or call.
+  # https://developers.facebook.com/docs/whatsapp/cloud-api/guides/send-messages
+  # Do not raise this. Lower it if you want a safety margin against clock skew.
+  seconds: 86400
+  # Refuse free-form sends when fewer than this many seconds remain, to avoid
+  # losing a race between the gate check and the API call.
+  safety_margin_seconds: 60
+
+templates:
+  # VERIFIED categories: AUTHENTICATION, MARKETING, UTILITY.
+  # https://developers.facebook.com/documentation/business-messaging/whatsapp/templates/overview
+  # Only templates listed here AND with status APPROVED will be sent.
+  allowed:
+    - name: "appointment_reminder_v3"
+      category: "UTILITY"
+      language: "en_US"
+      status: "APPROVED"
+      requires_marketing_optin: false
+    - name: "order_shipped_v2"
+      category: "UTILITY"
+      language: "en_US"
+      status: "APPROVED"
+      requires_marketing_optin: false
+    - name: "login_code_v1"
+      category: "AUTHENTICATION"
+      language: "en_US"
+      status: "APPROVED"
+      requires_marketing_optin: false
+    - name: "seasonal_offer_v1"
+      category: "MARKETING"
+      language: "en_US"
+      status: "PAUSED"   # paused templates cannot be sent until resolved
+      requires_marketing_optin: true
+
+quality_monitor:
+  # Circuit breaker trip conditions. When ANY of these fires, outbound halts for
+  # the phone number until a human clears wa.circuit_breaker.
+  #
+  # PARTLY UNVERIFIED: Meta's docs show quality_score values GREEN, NA and
+  # UNKNOWN in API examples and describe a "Flagged" status that lowers your
+  # messaging limit. YELLOW and RED are widely reported in the Business Help
+  # Center but are NOT quoted from the developer docs this kit cites, so treat
+  # the mapping below as this kit's convention.
+  trip_on_quality_score: ["RED", "YELLOW"]
+  trip_on_account_event: ["FLAGGED", "DISABLED", "RESTRICTED", "ACCOUNT_VIOLATION"]
+  trip_on_template_paused: true
+  # Trip if this many distinct templates get quality-downgraded within the window.
+  template_downgrades_window_hours: 24
+  template_downgrades_threshold: 2
+  # Trip if the share of outbound messages that never reach 'delivered' exceeds
+  # this over the window. A spike in undelivered is an early block signal.
+  undelivered_ratio_window_hours: 6
+  undelivered_ratio_threshold: 0.25
+  undelivered_min_sample: 40
+  # The breaker never auto-clears. A human sets cleared_at / cleared_by.
+  auto_clear: false
+
+opt_out:
+  # Extra whole-message keywords to treat as opt-out, on top of the built-in
+  # multi-language list in logic/gate.js. Matching is whole-message, normalized,
+  # case-insensitive.
+  extra_keywords: []
+  # Sent once, immediately, when an opt-out is recorded. This is a reply inside
+  # an open window, so it is allowed as a free-form service message.
+  confirmation_message: "You are unsubscribed and will not receive further messages from Example Widgets Ltd. Reply START if you change your mind."
+  # Whole-message keywords that count as an explicit re-opt-in.
+  reopt_in_keywords: ["start", "unstop", "subscribe", "yes"]
+
+logging:
+  # Truncate stored message bodies. Do not warehouse full customer messages
+  # unless you have a reason and a retention policy.
+  body_preview_chars: 160
+  # Log every refusal loudly. Turning this off defeats the point of the kit.
+  log_refusals: true
+  alert_webhook_url: ""   # optional: Slack/Teams incoming webhook for refusals + breaker trips

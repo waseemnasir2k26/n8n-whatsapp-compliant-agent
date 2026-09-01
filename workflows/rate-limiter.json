@@ -1,0 +1,382 @@
+{
+  "name": "rate-limiter",
+  "nodes": [
+    {
+      "id": "rl-note",
+      "name": "Note rl-note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -520,
+        -200
+      ],
+      "parameters": {
+        "content": "## rate-limiter\n\nTop lane: called before every send. Caps = min(Meta tier, your own cap).\nBottom lane: daily audit of headroom and refusal spikes.\n\nTiers verified: 250 / 2K / 10K / 100K / unlimited unique customers per 24h.\nhttps://developers.facebook.com/documentation/business-messaging/whatsapp/messaging-limits\n\nBurst numbers are self-imposed, NOT quoted from Meta.",
+        "width": 560,
+        "height": 300,
+        "color": 4
+      }
+    },
+    {
+      "id": "rl-in",
+      "name": "Rate Check In",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        140,
+        -20
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "wa_id",
+              "type": "string"
+            },
+            {
+              "name": "business_phone_id",
+              "type": "string"
+            },
+            {
+              "name": "tier",
+              "type": "string"
+            },
+            {
+              "name": "self_imposed_daily_unique_recipients",
+              "type": "number"
+            },
+            {
+              "name": "self_imposed_daily_total_messages",
+              "type": "number"
+            },
+            {
+              "name": "burst_max_messages_per_window",
+              "type": "number"
+            },
+            {
+              "name": "min_seconds_between_messages_per_contact",
+              "type": "number"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "rl-count",
+      "name": "Count Recent Sends",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        360,
+        -20
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  '{{ $json.business_phone_id }}'::text AS business_phone_id,\n  COUNT(*) FILTER (WHERE created_at > now() - INTERVAL '24 hours')                       AS sent_24h,\n  COUNT(DISTINCT wa_id) FILTER (WHERE created_at > now() - INTERVAL '24 hours')          AS unique_recipients_24h,\n  COUNT(*) FILTER (WHERE created_at > now() - INTERVAL '60 seconds')                     AS sent_burst_window,\n  COUNT(*) FILTER (WHERE wa_id = '{{ $json.wa_id }}'\n                     AND created_at > now() - INTERVAL '15 seconds')                     AS sent_to_contact_recent\nFROM wa.message_log\nWHERE direction = 'outbound'\n  AND business_phone_id = '{{ $json.business_phone_id }}';",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "rl-caps",
+      "name": "Apply Caps",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        -20
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Per-number send caps.\n//\n// VERIFIED: Meta's messaging limits are tiers of UNIQUE customers you may start\n// a conversation with per rolling 24 hours: 250 (new portfolios), 2K, 10K,\n// 100K, unlimited. Replies inside an open customer service window are not what\n// the tier counts, but they still shape how spammy your number looks.\n// https://developers.facebook.com/documentation/business-messaging/whatsapp/messaging-limits\n//\n// UNVERIFIED: the burst numbers below. Meta documents throughput but this kit\n// does not encode a published per-second figure. Treat them as self-imposed.\nconst TIERS = { 'TIER_250': 250, 'TIER_1K': 1000, 'TIER_2K': 2000, 'TIER_10K': 10000, 'TIER_100K': 100000, 'UNLIMITED': Number.MAX_SAFE_INTEGER };\n\nconst cfg = $('Rate Check In').first().json;\nconst counts = $input.first().json || {};\n\nconst tierName = String(cfg.tier || 'TIER_250').toUpperCase();\nconst tierCap = TIERS[tierName] !== undefined ? TIERS[tierName] : 250;\nconst selfUniqueCap = Number(cfg.self_imposed_daily_unique_recipients || 0) || tierCap;\nconst uniqueCap = Math.min(tierCap, selfUniqueCap);\nconst totalCap = Number(cfg.self_imposed_daily_total_messages || 0);\nconst burstCap = Number(cfg.burst_max_messages_per_window || 20);\nconst perContactGap = Number(cfg.min_seconds_between_messages_per_contact || 15);\n\nconst uniqueUsed = Number(counts.unique_recipients_24h || 0);\nconst totalUsed = Number(counts.sent_24h || 0);\nconst burstUsed = Number(counts.sent_burst_window || 0);\nconst contactRecent = Number(counts.sent_to_contact_recent || 0);\n\nconst breaches = [];\nif (uniqueUsed >= uniqueCap) {\n  breaches.push({ code: 'TIER_UNIQUE_CAP', detail: uniqueUsed + '/' + uniqueCap + ' unique recipients in 24h' });\n}\nif (totalCap > 0 && totalUsed >= totalCap) {\n  breaches.push({ code: 'DAILY_CAP_REACHED', detail: totalUsed + '/' + totalCap + ' messages in 24h' });\n}\nif (burstCap > 0 && burstUsed >= burstCap) {\n  breaches.push({ code: 'BURST_CAP_REACHED', detail: burstUsed + '/' + burstCap + ' in the burst window' });\n}\nif (perContactGap > 0 && contactRecent > 0) {\n  breaches.push({ code: 'PER_CONTACT_COOLDOWN', detail: 'sent to this contact within the last ' + perContactGap + 's' });\n}\n\nreturn [{\n  json: {\n    business_phone_id: cfg.business_phone_id,\n    wa_id: cfg.wa_id,\n    allow: breaches.length === 0,\n    gate_code: breaches.length === 0 ? 'OK_RATE' : breaches[0].code,\n    gate_reason: breaches.length === 0\n      ? 'Within caps (' + uniqueUsed + '/' + uniqueCap + ' unique, ' + burstUsed + '/' + burstCap + ' burst).'\n      : breaches.map(function (b) { return b.code + ': ' + b.detail; }).join('; '),\n    tier: tierName,\n    tier_cap: tierCap,\n    unique_cap: uniqueCap,\n    unique_used: uniqueUsed,\n    unique_headroom: Math.max(0, uniqueCap - uniqueUsed),\n    total_used: totalUsed,\n    burst_used: burstUsed,\n    breaches: breaches\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "rl-if",
+      "name": "Within Caps?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        800,
+        -20
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "rl-if-c1",
+              "leftValue": "={{ $json.allow }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "rl-ok",
+      "name": "Rate OK",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        -120
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "rl-log",
+      "name": "Log Rate Refusal",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        1020,
+        80
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wa.message_log\n  (wa_id, business_phone_id, direction, message_type, gate_code, gate_reason)\nVALUES ('{{ $json.wa_id }}', '{{ $json.business_phone_id }}', 'refused', 'none',\n        '{{ $json.gate_code }}', {{ JSON.stringify($json.gate_reason) }});",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "rl-cron",
+      "name": "Daily Headroom Audit",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        140,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24,
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "rl-headroom",
+      "name": "Read 24h Counters",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        360,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT business_phone_id,\n       COUNT(DISTINCT wa_id) FILTER (WHERE created_at > now() - INTERVAL '24 hours') AS unique_recipients_24h,\n       COUNT(*) FILTER (WHERE created_at > now() - INTERVAL '24 hours')              AS sent_24h,\n       COUNT(*) FILTER (WHERE direction = 'refused'\n                          AND created_at > now() - INTERVAL '24 hours')              AS refusals_24h\nFROM wa.message_log\nGROUP BY business_phone_id;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "rl-trend",
+      "name": "Score Headroom",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Daily audit: how close is each number to its cap, and how many sends did\n// the gates refuse? A refusal spike usually means someone is trying to blast.\nconst REPORT_UNIQUE_CAP = 250; // set to your granted tier\nconst WARN_AT = 0.8;\nconst out = [];\nfor (const item of $input.all()) {\n  const r = item.json || {};\n  const used = Number(r.unique_recipients_24h || 0);\n  const ratio = REPORT_UNIQUE_CAP > 0 ? used / REPORT_UNIQUE_CAP : 0;\n  out.push({\n    json: {\n      business_phone_id: r.business_phone_id,\n      unique_recipients_24h: used,\n      sent_24h: Number(r.sent_24h || 0),\n      refusals_24h: Number(r.refusals_24h || 0),\n      cap: REPORT_UNIQUE_CAP,\n      utilization: Math.round(ratio * 100) / 100,\n      needs_attention: ratio >= WARN_AT || Number(r.refusals_24h || 0) > 0\n    }\n  });\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "rl-attn",
+      "name": "Needs Attention?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        800,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "rl-attn-c1",
+              "leftValue": "={{ $json.needs_attention }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "rl-alert",
+      "name": "Raise Headroom Alert",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        300
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Rate Check In": {
+      "main": [
+        [
+          {
+            "node": "Count Recent Sends",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Count Recent Sends": {
+      "main": [
+        [
+          {
+            "node": "Apply Caps",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Caps": {
+      "main": [
+        [
+          {
+            "node": "Within Caps?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Within Caps?": {
+      "main": [
+        [
+          {
+            "node": "Rate OK",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Rate Refusal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily Headroom Audit": {
+      "main": [
+        [
+          {
+            "node": "Read 24h Counters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read 24h Counters": {
+      "main": [
+        [
+          {
+            "node": "Score Headroom",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score Headroom": {
+      "main": [
+        [
+          {
+            "node": "Needs Attention?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Attention?": {
+      "main": [
+        [
+          {
+            "node": "Raise Headroom Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "name": "whatsapp-compliance"
+    }
+  ]
+}

@@ -1,0 +1,403 @@
+{
+  "name": "quality-monitor",
+  "nodes": [
+    {
+      "id": "qm-note",
+      "name": "Note qm-note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -540,
+        -220
+      ],
+      "parameters": {
+        "content": "## quality-monitor\n\nTop lane: Meta account/quality webhooks -> quality_events -> trip breaker.\nBottom lane: 6-hourly undelivered-ratio sweep, in case no webhook arrives.\n\nSubscribe your app to: phone_number_quality_update,\nmessage_template_quality_update, message_template_status_update,\naccount_update, account_alerts, business_capability_update.\nhttps://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/overview\n\nThe breaker NEVER auto-clears. A human clears it.",
+        "width": 580,
+        "height": 360,
+        "color": 4
+      }
+    },
+    {
+      "id": "qm-webhook",
+      "name": "Meta Account Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        140,
+        -40
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wa/quality",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "webhookId": "33333333-3333-4333-8333-333333333333"
+    },
+    {
+      "id": "qm-classify",
+      "name": "Classify Quality Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        -40
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Ingest Meta's account and quality webhooks and decide whether to trip the\n// circuit breaker.\n//\n// VERIFIED webhook fields (subscribe to these on your app):\n//   phone_number_quality_update, message_template_quality_update,\n//   message_template_status_update, account_update, account_alerts,\n//   business_capability_update\n//   https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/overview\n//\n// PARTLY UNVERIFIED: the developer docs show quality_score values GREEN, NA and\n// UNKNOWN in examples and describe a \"Flagged\" status that lowers your limit.\n// YELLOW and RED are widely reported but are NOT quoted from the developer docs\n// cited here, so the mapping below is this kit's conservative convention.\nconst TRIP_SCORES = ['RED', 'YELLOW', 'FLAGGED'];\nconst TRIP_EVENTS = ['FLAGGED', 'DISABLED', 'RESTRICTED', 'ACCOUNT_VIOLATION', 'ACCOUNT_RESTRICTION', 'DOWNGRADE'];\n\nconst out = [];\nfor (const item of $input.all()) {\n  const body = item.json.body || item.json;\n  for (const entry of (body.entry || [])) {\n    for (const change of (entry.changes || [])) {\n      const field = change.field || 'unknown';\n      const value = change.value || {};\n      const score = String(\n        (value.current_limit && value.event === 'FLAGGED' ? 'FLAGGED' : '') ||\n        (value.quality_score && (value.quality_score.score || value.quality_score)) ||\n        value.new_quality_score || ''\n      ).toUpperCase();\n      const event = String(value.event || value.decision || '').toUpperCase();\n      const templateName = value.message_template_name || value.name || null;\n      const templateStatus = String(value.new_template_status || value.event || '').toUpperCase();\n\n      const reasons = [];\n      if (score && TRIP_SCORES.indexOf(score) >= 0) {\n        reasons.push('quality score ' + score + ' on ' + field);\n      }\n      if (event && TRIP_EVENTS.indexOf(event) >= 0) {\n        reasons.push('account event ' + event + ' on ' + field);\n      }\n      if (field === 'message_template_status_update' && templateStatus === 'PAUSED') {\n        reasons.push('template ' + (templateName || 'unknown') + ' PAUSED for negative feedback');\n      }\n      if (field === 'message_template_status_update' && templateStatus === 'REJECTED') {\n        reasons.push('template ' + (templateName || 'unknown') + ' REJECTED');\n      }\n\n      out.push({\n        json: {\n          business_phone_id: String(value.display_phone_number_id || value.phone_number_id ||\n                                    (value.metadata || {}).phone_number_id || entry.id || ''),\n          field: field,\n          event: event || null,\n          current_limit: value.current_limit || null,\n          quality_score: score || null,\n          template_name: templateName,\n          raw: JSON.stringify(value),\n          should_trip: reasons.length > 0,\n          trip_reason: reasons.join('; ') || null,\n          occurred_at: new Date().toISOString()\n        }\n      });\n    }\n  }\n}\nif (out.length === 0) { return []; }\nreturn out;\n"
+      }
+    },
+    {
+      "id": "qm-insert",
+      "name": "Record Quality Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        580,
+        -40
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wa.quality_events\n  (business_phone_id, field, event, current_limit, quality_score, template_name, raw, occurred_at)\nVALUES\n  ('{{ $json.business_phone_id }}', '{{ $json.field }}',\n   {{ $json.event ? \"'\" + $json.event + \"'\" : 'NULL' }},\n   {{ $json.current_limit ? \"'\" + $json.current_limit + \"'\" : 'NULL' }},\n   {{ $json.quality_score ? \"'\" + $json.quality_score + \"'\" : 'NULL' }},\n   {{ $json.template_name ? \"'\" + $json.template_name + \"'\" : 'NULL' }},\n   '{{ $json.raw }}'::jsonb, '{{ $json.occurred_at }}'::timestamptz)\nRETURNING id;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "qm-if",
+      "name": "Trip Breaker?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        800,
+        -40
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "qm-if-c1",
+              "leftValue": "={{ $('Classify Quality Event').item.json.should_trip }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "qm-trip",
+      "name": "Open Circuit Breaker",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        1020,
+        -140
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Halt ALL outbound for this number. Never auto-clears: a human sets\n-- cleared_at / cleared_by after fixing the underlying cause.\nINSERT INTO wa.circuit_breaker (business_phone_id, open, reason, opened_at, updated_at)\nVALUES ('{{ $('Classify Quality Event').item.json.business_phone_id }}', TRUE,\n        {{ JSON.stringify($('Classify Quality Event').item.json.trip_reason) }}, now(), now())\nON CONFLICT (business_phone_id) DO UPDATE\nSET open = TRUE,\n    reason = EXCLUDED.reason,\n    opened_at = COALESCE(wa.circuit_breaker.opened_at, now()),\n    cleared_at = NULL,\n    cleared_by = NULL,\n    updated_at = now()\nRETURNING business_phone_id, open, reason, opened_at;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "qm-halted",
+      "name": "Outbound Halted",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1240,
+        -140
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "qm-ok",
+      "name": "Logged Only",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        60
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "qm-cron",
+      "name": "Undelivered Ratio Sweep",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        140,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "qm-sweep",
+      "name": "Read Delivery Stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        360,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Undelivered ratio: a spike is an early warning that your number is being\n-- throttled or blocked, before Meta's own webhook says anything.\nSELECT business_phone_id,\n       COUNT(*)                                                   AS sent,\n       COUNT(*) FILTER (WHERE wamid IS NULL)                      AS no_wamid,\n       COUNT(*) FILTER (WHERE direction = 'refused')              AS refusals\nFROM wa.message_log\nWHERE created_at > now() - INTERVAL '6 hours'\n  AND direction IN ('outbound', 'refused')\nGROUP BY business_phone_id;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "qm-eval",
+      "name": "Evaluate Delivery Trend",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Trend sweep. Trips the breaker on a bad undelivered ratio even when Meta has\n// sent no quality webhook - webhook availability is not guaranteed and is the\n// single biggest blind spot in this kit. See README Limitations.\nconst MIN_SAMPLE = 40;\nconst THRESHOLD = 0.25;\nconst out = [];\nfor (const item of $input.all()) {\n  const r = item.json || {};\n  const sent = Number(r.sent || 0);\n  const bad = Number(r.no_wamid || 0);\n  const ratio = sent > 0 ? bad / sent : 0;\n  const trip = sent >= MIN_SAMPLE && ratio >= THRESHOLD;\n  out.push({\n    json: {\n      business_phone_id: r.business_phone_id,\n      sent: sent,\n      undelivered: bad,\n      refusals: Number(r.refusals || 0),\n      undelivered_ratio: Math.round(ratio * 1000) / 1000,\n      should_trip: trip,\n      trip_reason: trip\n        ? ('undelivered ratio ' + Math.round(ratio * 100) + '% over ' + sent + ' sends in 6h')\n        : null\n    }\n  });\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "qm-if2",
+      "name": "Trend Bad?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        800,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "qm-if2-c1",
+              "leftValue": "={{ $json.should_trip }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "qm-trip2",
+      "name": "Open Breaker On Trend",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        1020,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wa.circuit_breaker (business_phone_id, open, reason, opened_at, updated_at)\nVALUES ('{{ $json.business_phone_id }}', TRUE,\n        {{ JSON.stringify($json.trip_reason) }}, now(), now())\nON CONFLICT (business_phone_id) DO UPDATE\nSET open = TRUE, reason = EXCLUDED.reason,\n    opened_at = COALESCE(wa.circuit_breaker.opened_at, now()),\n    cleared_at = NULL, cleared_by = NULL, updated_at = now()\nRETURNING business_phone_id, open, reason;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "qm-clean",
+      "name": "Trend Clean",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        440
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Meta Account Webhook": {
+      "main": [
+        [
+          {
+            "node": "Classify Quality Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Quality Event": {
+      "main": [
+        [
+          {
+            "node": "Record Quality Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Quality Event": {
+      "main": [
+        [
+          {
+            "node": "Trip Breaker?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trip Breaker?": {
+      "main": [
+        [
+          {
+            "node": "Open Circuit Breaker",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Logged Only",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Circuit Breaker": {
+      "main": [
+        [
+          {
+            "node": "Outbound Halted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Undelivered Ratio Sweep": {
+      "main": [
+        [
+          {
+            "node": "Read Delivery Stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Delivery Stats": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Delivery Trend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Delivery Trend": {
+      "main": [
+        [
+          {
+            "node": "Trend Bad?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trend Bad?": {
+      "main": [
+        [
+          {
+            "node": "Open Breaker On Trend",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Trend Clean",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "name": "whatsapp-compliance"
+    }
+  ]
+}

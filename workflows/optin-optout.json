@@ -1,0 +1,379 @@
+{
+  "name": "optin-optout",
+  "nodes": [
+    {
+      "id": "oo-note",
+      "name": "Note oo-note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -520,
+        -220
+      ],
+      "parameters": {
+        "content": "## optin-optout\n\nTop lane: consent captured off-platform (web form, IVR, paper) -> ledger.\nBottom lane: STOP / UNSUBSCRIBE typed into WhatsApp -> immediate opt-out.\n\nThe ledger is append-only and is your proof of consent.\nOpt-in requirements verified against\nhttps://developers.facebook.com/documentation/business-messaging/whatsapp/getting-opt-in\n\nSTOP keyword list is this kit's own convention - Meta publishes no mandated list.",
+        "width": 560,
+        "height": 340,
+        "color": 4
+      }
+    },
+    {
+      "id": "oo-webhook",
+      "name": "Consent Capture Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        140,
+        -40
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wa/consent",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "webhookId": "22222222-2222-4222-8222-222222222222"
+    },
+    {
+      "id": "oo-normalize",
+      "name": "Normalize Consent Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        -40
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Normalize an opt-in captured anywhere (web form, IVR, paper, CRM import)\n// into one ledger event. Meta requires the opt-in to name the business and to\n// state that the person is opting in to receive messages from it.\n// https://developers.facebook.com/documentation/business-messaging/whatsapp/getting-opt-in\nconst results = [];\nfor (const item of $input.all()) {\n  const b = item.json.body || item.json;\n  const waId = String(b.wa_id || '').replace(/[^0-9]/g, '');\n  if (!waId) { throw new Error('opt-in event has no wa_id'); }\n  const source = String(b.source || '').trim();\n  if (!source) { throw new Error('opt-in event for ' + waId + ' has no source - consent without a source is not proof'); }\n  const businessName = String(b.business_name || '').trim();\n  if (!businessName) { throw new Error('opt-in event for ' + waId + ' does not name the business'); }\n  const event = b.event === 'opt_out' ? 'opt_out' : 'opt_in';\n  const scope = ['all', 'marketing', 'utility', 'authentication'].indexOf(b.scope) >= 0 ? b.scope : 'all';\n  results.push({\n    json: {\n      wa_id: waId,\n      business_phone_id: String(b.business_phone_id || ''),\n      event: event,\n      scope: scope,\n      source: source,\n      source_detail: JSON.stringify(b.source_detail || {}),\n      consent_text: b.consent_text || null,\n      business_name: businessName,\n      occurred_at: b.occurred_at || new Date().toISOString(),\n      marketing: event === 'opt_in' && (scope === 'all' || scope === 'marketing')\n    }\n  });\n}\nreturn results;\n"
+      }
+    },
+    {
+      "id": "oo-ledger",
+      "name": "Append To Opt-In Ledger",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        580,
+        -40
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Append-only. The database trigger rejects UPDATE and DELETE here.\nWITH c AS (\n  INSERT INTO wa.contacts (wa_id, business_phone_id)\n  VALUES ('{{ $json.wa_id }}', '{{ $json.business_phone_id }}')\n  ON CONFLICT (business_phone_id, wa_id) DO UPDATE SET updated_at = now()\n  RETURNING id\n)\nINSERT INTO wa.opt_in_ledger\n  (contact_id, wa_id, event, scope, source, source_detail, consent_text, business_name, occurred_at)\nSELECT c.id, '{{ $json.wa_id }}', '{{ $json.event }}', '{{ $json.scope }}',\n       '{{ $json.source }}', '{{ $json.source_detail }}'::jsonb,\n       {{ $json.consent_text ? JSON.stringify($json.consent_text) : 'NULL' }},\n       '{{ $json.business_name }}', '{{ $json.occurred_at }}'::timestamptz\nFROM c\nRETURNING id AS ledger_id, contact_id, wa_id, event, scope, occurred_at;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "oo-sync",
+      "name": "Sync Contact Consent State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        800,
+        -40
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Cache the ledger's verdict on wa.contacts.\n-- Opt-out wins and is irreversible until a NEW opt_in row is appended.\nUPDATE wa.contacts SET\n  opted_in           = CASE WHEN '{{ $json.event }}' = 'opt_in'  THEN TRUE  ELSE opted_in END,\n  opted_in_at        = CASE WHEN '{{ $json.event }}' = 'opt_in'  THEN '{{ $json.occurred_at }}'::timestamptz ELSE opted_in_at END,\n  marketing_opted_in = CASE\n                         WHEN '{{ $json.event }}' = 'opt_out' THEN FALSE\n                         WHEN '{{ $json.event }}' = 'opt_in' AND '{{ $json.scope }}' IN ('all','marketing') THEN TRUE\n                         ELSE marketing_opted_in END,\n  opted_out          = CASE WHEN '{{ $json.event }}' = 'opt_out' THEN TRUE ELSE FALSE END,\n  opted_out_at       = CASE WHEN '{{ $json.event }}' = 'opt_out' THEN '{{ $json.occurred_at }}'::timestamptz ELSE NULL END,\n  updated_at         = now()\nWHERE id = {{ $json.contact_id }}\nRETURNING id AS contact_id, wa_id, opted_in, marketing_opted_in, opted_out, opted_out_at;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "oo-done",
+      "name": "Consent Recorded",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        -40
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "oo-sub",
+      "name": "Inbound Message In",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        140,
+        240
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "wa_id",
+              "type": "string"
+            },
+            {
+              "name": "business_phone_id",
+              "type": "string"
+            },
+            {
+              "name": "text",
+              "type": "string"
+            },
+            {
+              "name": "wamid",
+              "type": "string"
+            },
+            {
+              "name": "inbound_at",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "oo-keyword",
+      "name": "Detect Consent Keyword",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        240
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Detect an opt-out (or an explicit re-opt-in) in an inbound message.\n// Generated from logic/gate.js core - see tools/build_workflows.py.\nvar WINDOW_SECONDS = 86400; // 24 hours. Verified: Meta send-messages guide.\n\n// Template categories Meta actually defines. \"SERVICE\" is NOT a template\n// category - service messages are the free-form messages you may send while a\n// customer service window is open.\nvar TEMPLATE_CATEGORIES = [\"AUTHENTICATION\", \"MARKETING\", \"UTILITY\"];\n\n// UNVERIFIED against Meta docs: WhatsApp does not publish a mandated STOP\n// keyword list the way SMS carriers do. This list is this kit's own convention\n// for honoring \"clear instructions for how people can opt out\". Extend it for\n// your own markets - it is deliberately conservative, because a false opt-out\n// is cheaper than an ignored one.\nvar STOP_KEYWORDS = [\n  \"stop\",\n  \"unsubscribe\",\n  \"cancel\",\n  \"end\",\n  \"quit\",\n  \"optout\",\n  \"opt out\",\n  \"baja\",\n  \"parar\",\n  \"cancelar\",\n  \"detener\",\n  \"arret\",\n  \"arreter\",\n  \"desabonner\",\n  \"stopp\",\n  \"abmelden\",\n  \"beenden\",\n  \"sair\",\n  \"cancelar tudo\",\n  \"berhenti\",\n  \"henti\",\n  \"basta\",\n  \"annulla\",\n  \"stop tout\",\n];\n\nfunction normalizeText(value) {\n  if (typeof value !== \"string\") {\n    return \"\";\n  }\n  return value\n    .toLowerCase()\n    .replace(/[^a-z0-9 ]+/g, \" \")\n    .replace(/\\s+/g, \" \")\n    .trim();\n}\n\n// True only when the whole message is an opt-out instruction. A message that\n// merely contains the word \"stop\" (\"stop by tomorrow\") is not an opt-out.\nfunction isOptOutMessage(text) {\n  var normalized = normalizeText(text);\n  if (!normalized) {\n    return false;\n  }\n  for (var i = 0; i < STOP_KEYWORDS.length; i++) {\n    if (normalized === STOP_KEYWORDS[i]) {\n      return true;\n    }\n  }\n  return false;\n}\n\nfunction toEpochSeconds(value) {\n  if (value === null || value === undefined || value === \"\") {\n    return null;\n  }\n  if (typeof value === \"number\") {\n    return Math.floor(value > 1e12 ? value / 1000 : value);\n  }\n  var parsed = Date.parse(value);\n  if (isNaN(parsed)) {\n    return null;\n  }\n  return Math.floor(parsed / 1000);\n}\n\n// The customer service window: opens/resets on every inbound user message or\n// call and lasts 24h. Exactly 24h elapsed counts as CLOSED - the boundary is\n// treated conservatively so a one-second clock skew cannot produce an\n// out-of-window free-form send.\nfunction windowState(input) {\n  var now = toEpochSeconds(input && input.now);\n  var last = toEpochSeconds(input && input.lastInboundAt);\n  if (now === null) {\n    throw new Error(\"windowState: now is required\");\n  }\n  if (last === null) {\n    return {\n      open: false,\n      elapsedSeconds: null,\n      secondsRemaining: 0,\n      everContacted: false,\n    };\n  }\n  var elapsed = now - last;\n  if (elapsed < 0) {\n    elapsed = 0;\n  } // future timestamp = clock skew, treat as just now\n  var open = elapsed < WINDOW_SECONDS;\n  return {\n    open: open,\n    elapsedSeconds: elapsed,\n    secondsRemaining: open ? WINDOW_SECONDS - elapsed : 0,\n    everContacted: true,\n  };\n}\n\nfunction rateState(input) {\n  var sent24h = Number((input && input.sent24h) || 0);\n  var dailyCap = Number((input && input.dailyCap) || 0);\n  var sentBurstWindow = Number((input && input.sentBurstWindow) || 0);\n  var burstCap = Number((input && input.burstCap) || 0);\n  var dailyExhausted = dailyCap > 0 && sent24h >= dailyCap;\n  var burstExhausted = burstCap > 0 && sentBurstWindow >= burstCap;\n  return {\n    dailyExhausted: dailyExhausted,\n    burstExhausted: burstExhausted,\n    dailyRemaining: dailyCap > 0 ? Math.max(0, dailyCap - sent24h) : null,\n    burstRemaining:\n      burstCap > 0 ? Math.max(0, burstCap - sentBurstWindow) : null,\n  };\n}\n\nfunction deny(code, reason, extra) {\n  var out = {\n    allow: false,\n    action: \"block\",\n    code: code,\n    reason: reason,\n    requiresTemplate: false,\n  };\n  if (extra) {\n    for (var k in extra) {\n      if (Object.prototype.hasOwnProperty.call(extra, k)) {\n        out[k] = extra[k];\n      }\n    }\n  }\n  return out;\n}\n\n/*\n * evaluateSend - the single gate every outbound message must pass.\n *\n * request: {\n *   now, lastInboundAt,\n *   optedOut, optedOutAt, optInAt, marketingOptIn,\n *   messageType: 'freeform' | 'template',\n *   templateName, templateStatus, templateCategory,\n *   sent24h, dailyCap, sentBurstWindow, burstCap,\n *   circuitBreakerOpen, circuitBreakerReason\n * }\n *\n * Returns { allow, action, code, reason, window, rate, messageType }.\n * action is one of: 'send_freeform' | 'send_template' | 'block'.\n * A refusal is never silent: the caller MUST log every allow:false result.\n */\nfunction evaluateSend(request) {\n  var req = request || {};\n  var win = windowState({ now: req.now, lastInboundAt: req.lastInboundAt });\n  var rate = rateState(req);\n  var messageType = req.messageType === \"template\" ? \"template\" : \"freeform\";\n  var context = { window: win, rate: rate, messageType: messageType };\n\n  // 1. Circuit breaker - quality degraded, all outbound halted.\n  if (req.circuitBreakerOpen === true) {\n    return deny(\n      \"CIRCUIT_BREAKER_OPEN\",\n      \"Outbound halted by the quality circuit breaker: \" +\n        (req.circuitBreakerReason || \"unspecified\"),\n      context,\n    );\n  }\n\n  // 2. Opt-out is absolute and applies inside the window too. Reversible only\n  // by an explicit new opt-in event written to the ledger.\n  if (req.optedOut === true) {\n    return deny(\n      \"OPTED_OUT\",\n      \"Contact opted out at \" +\n        (req.optedOutAt || \"unknown time\") +\n        \". Sending requires a new explicit opt-in.\",\n      context,\n    );\n  }\n\n  // 3. Rate limits, checked before the window so a burst cannot be laundered\n  // through an open window.\n  if (rate.dailyExhausted) {\n    return deny(\n      \"DAILY_CAP_REACHED\",\n      \"Daily send cap reached (\" +\n        Number(req.sent24h || 0) +\n        \"/\" +\n        Number(req.dailyCap || 0) +\n        \").\",\n      context,\n    );\n  }\n  if (rate.burstExhausted) {\n    return deny(\n      \"BURST_CAP_REACHED\",\n      \"Burst cap reached (\" +\n        Number(req.sentBurstWindow || 0) +\n        \"/\" +\n        Number(req.burstCap || 0) +\n        \" in the burst window).\",\n      context,\n    );\n  }\n\n  // 4. Window open -> free-form service messages are allowed.\n  if (win.open) {\n    if (messageType === \"template\") {\n      if (req.templateStatus !== \"APPROVED\") {\n        return deny(\n          \"TEMPLATE_NOT_APPROVED\",\n          \"Template \" +\n            (req.templateName || \"(unnamed)\") +\n            \" has status \" +\n            (req.templateStatus || \"UNKNOWN\") +\n            \", not APPROVED.\",\n          context,\n        );\n      }\n      return {\n        allow: true,\n        action: \"send_template\",\n        code: \"OK_TEMPLATE_IN_WINDOW\",\n        reason: \"Window open; approved template.\",\n        requiresTemplate: false,\n        window: win,\n        rate: rate,\n        messageType: messageType,\n      };\n    }\n    return {\n      allow: true,\n      action: \"send_freeform\",\n      code: \"OK_WINDOW_OPEN\",\n      reason:\n        \"Customer service window open, \" +\n        win.secondsRemaining +\n        \"s remaining.\",\n      requiresTemplate: false,\n      window: win,\n      rate: rate,\n      messageType: messageType,\n    };\n  }\n\n  // 5. Window closed. Business-initiated territory: opt-in is mandatory.\n  if (toEpochSeconds(req.optInAt) === null) {\n    return deny(\n      \"NO_OPT_IN\",\n      \"No opt-in on record and the customer service window is closed. Business-initiated messages require opt-in.\",\n      context,\n    );\n  }\n\n  if (messageType !== \"template\") {\n    var refusal = deny(\n      \"TEMPLATE_REQUIRED\",\n      \"Customer service window closed\" +\n        (win.everContacted\n          ? \" (\" + win.elapsedSeconds + \"s since last inbound)\"\n          : \" (no inbound on record)\") +\n        \". Free-form messages outside the window are a policy violation - send an approved template instead.\",\n      context,\n    );\n    refusal.requiresTemplate = true;\n    return refusal;\n  }\n\n  if (req.templateStatus !== \"APPROVED\") {\n    return deny(\n      \"TEMPLATE_NOT_APPROVED\",\n      \"Template \" +\n        (req.templateName || \"(unnamed)\") +\n        \" has status \" +\n        (req.templateStatus || \"UNKNOWN\") +\n        \", not APPROVED.\",\n      context,\n    );\n  }\n\n  var category = String(req.templateCategory || \"\").toUpperCase();\n  if (TEMPLATE_CATEGORIES.indexOf(category) === -1) {\n    return deny(\n      \"TEMPLATE_CATEGORY_INVALID\",\n      \"Template category \" +\n        (req.templateCategory || \"(none)\") +\n        \" is not one of \" +\n        TEMPLATE_CATEGORIES.join(\", \") +\n        \".\",\n      context,\n    );\n  }\n\n  // Marketing needs marketing-specific consent. UNVERIFIED as a separate,\n  // explicit Meta requirement: Meta requires opt-in and requires honoring\n  // opt-out \"for specific categories of messages\". This kit enforces a distinct\n  // marketing consent flag because that is the safe reading.\n  if (category === \"MARKETING\" && req.marketingOptIn !== true) {\n    return deny(\n      \"NO_MARKETING_OPT_IN\",\n      \"MARKETING template requested but the contact has no marketing opt-in on record.\",\n      context,\n    );\n  }\n\n  return {\n    allow: true,\n    action: \"send_template\",\n    code: \"OK_TEMPLATE_OUT_OF_WINDOW\",\n    reason:\n      \"Window closed; approved \" +\n      category +\n      \" template with opt-in on record.\",\n    requiresTemplate: false,\n    window: win,\n    rate: rate,\n    messageType: messageType,\n  };\n}\n\n// ------------------------- n8n adapter -------------------------\n// Whole-message match only, so \"stop by the shop tomorrow\" is not an opt-out.\n// UNVERIFIED: WhatsApp does not publish a mandated keyword list. This is our\n// convention for \"provide clear instructions for how people can opt out, and\n// honor these requests\".\n// https://developers.facebook.com/documentation/business-messaging/whatsapp/getting-opt-in\nconst REOPT_IN = ['start', 'unstop', 'subscribe', 'yes'];\nconst results = [];\nfor (const item of $input.all()) {\n  const row = item.json || {};\n  const text = row.text || '';\n  const normalized = normalizeText(text);\n  let event = null;\n  if (isOptOutMessage(text)) {\n    event = 'opt_out';\n  } else if (REOPT_IN.indexOf(normalized) >= 0) {\n    event = 'opt_in';\n  }\n  results.push({\n    json: {\n      wa_id: row.wa_id,\n      business_phone_id: row.business_phone_id,\n      text: text,\n      consent_event: event,\n      is_consent_event: event !== null,\n      event: event || 'none',\n      scope: 'all',\n      source: 'whatsapp_keyword',\n      source_detail: JSON.stringify({ wamid: row.wamid || null, matched_text: normalized }),\n      consent_text: text,\n      business_name: row.business_name || 'REPLACE_WITH_YOUR_BUSINESS_NAME',\n      occurred_at: row.inbound_at || new Date().toISOString()\n    }\n  });\n}\nreturn results;\n"
+      }
+    },
+    {
+      "id": "oo-is",
+      "name": "Consent Keyword?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        580,
+        240
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "oo-is-c1",
+              "leftValue": "={{ $json.is_consent_event }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "oo-ledger2",
+      "name": "Append Keyword Event To Ledger",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        800,
+        160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Append-only. The database trigger rejects UPDATE and DELETE here.\nWITH c AS (\n  INSERT INTO wa.contacts (wa_id, business_phone_id)\n  VALUES ('{{ $json.wa_id }}', '{{ $json.business_phone_id }}')\n  ON CONFLICT (business_phone_id, wa_id) DO UPDATE SET updated_at = now()\n  RETURNING id\n)\nINSERT INTO wa.opt_in_ledger\n  (contact_id, wa_id, event, scope, source, source_detail, consent_text, business_name, occurred_at)\nSELECT c.id, '{{ $json.wa_id }}', '{{ $json.event }}', '{{ $json.scope }}',\n       '{{ $json.source }}', '{{ $json.source_detail }}'::jsonb,\n       {{ $json.consent_text ? JSON.stringify($json.consent_text) : 'NULL' }},\n       '{{ $json.business_name }}', '{{ $json.occurred_at }}'::timestamptz\nFROM c\nRETURNING id AS ledger_id, contact_id, wa_id, event, scope, occurred_at;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "oo-sync2",
+      "name": "Apply Consent Change Now",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        1020,
+        160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Cache the ledger's verdict on wa.contacts.\n-- Opt-out wins and is irreversible until a NEW opt_in row is appended.\nUPDATE wa.contacts SET\n  opted_in           = CASE WHEN '{{ $json.event }}' = 'opt_in'  THEN TRUE  ELSE opted_in END,\n  opted_in_at        = CASE WHEN '{{ $json.event }}' = 'opt_in'  THEN '{{ $json.occurred_at }}'::timestamptz ELSE opted_in_at END,\n  marketing_opted_in = CASE\n                         WHEN '{{ $json.event }}' = 'opt_out' THEN FALSE\n                         WHEN '{{ $json.event }}' = 'opt_in' AND '{{ $json.scope }}' IN ('all','marketing') THEN TRUE\n                         ELSE marketing_opted_in END,\n  opted_out          = CASE WHEN '{{ $json.event }}' = 'opt_out' THEN TRUE ELSE FALSE END,\n  opted_out_at       = CASE WHEN '{{ $json.event }}' = 'opt_out' THEN '{{ $json.occurred_at }}'::timestamptz ELSE NULL END,\n  updated_at         = now()\nWHERE id = {{ $json.contact_id }}\nRETURNING id AS contact_id, wa_id, opted_in, marketing_opted_in, opted_out, opted_out_at;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "oo-applied",
+      "name": "Consent Change Applied",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1240,
+        160
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "oo-nochange",
+      "name": "No Consent Change",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        800,
+        340
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Consent Capture Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Consent Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Consent Event": {
+      "main": [
+        [
+          {
+            "node": "Append To Opt-In Ledger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append To Opt-In Ledger": {
+      "main": [
+        [
+          {
+            "node": "Sync Contact Consent State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sync Contact Consent State": {
+      "main": [
+        [
+          {
+            "node": "Consent Recorded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inbound Message In": {
+      "main": [
+        [
+          {
+            "node": "Detect Consent Keyword",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Consent Keyword": {
+      "main": [
+        [
+          {
+            "node": "Consent Keyword?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consent Keyword?": {
+      "main": [
+        [
+          {
+            "node": "Append Keyword Event To Ledger",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Consent Change",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append Keyword Event To Ledger": {
+      "main": [
+        [
+          {
+            "node": "Apply Consent Change Now",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Consent Change Now": {
+      "main": [
+        [
+          {
+            "node": "Consent Change Applied",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "name": "whatsapp-compliance"
+    }
+  ]
+}

@@ -1,0 +1,552 @@
+{
+  "name": "example-agent",
+  "nodes": [
+    {
+      "id": "ea-note",
+      "name": "Note ea-note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -560,
+        -260
+      ],
+      "parameters": {
+        "content": "## example-agent\n\nA realistic responder wired through all five gates.\n\n1 window-tracker records the inbound and resets the 24h window\n2 optin-optout checks for STOP / START before anything else\n3 the AI drafts a reply (it can NEVER send)\n4 rate-limiter checks caps\n5 message-router applies the gate and is the only thing that calls Meta\n\nThis is a REPLY bot. It has no bulk send path, on purpose.",
+        "width": 580,
+        "height": 340,
+        "color": 4
+      }
+    },
+    {
+      "id": "ea-webhook",
+      "name": "WhatsApp Inbound",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        120,
+        60
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wa/agent",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "webhookId": "44444444-4444-4444-8444-444444444444"
+    },
+    {
+      "id": "ea-parse",
+      "name": "Parse Inbound",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        340,
+        60
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Same parser as window-tracker, kept local so the example runs standalone.\nconst out = [];\nfor (const item of $input.all()) {\n  const body = item.json.body || item.json;\n  for (const entry of (body.entry || [])) {\n    for (const change of (entry.changes || [])) {\n      const value = (change || {}).value || {};\n      const meta = value.metadata || {};\n      for (const msg of (value.messages || [])) {\n        if (msg.type !== 'text') { continue; }\n        out.push({\n          json: {\n            wa_id: msg.from,\n            business_phone_id: meta.phone_number_id || '',\n            wamid: msg.id,\n            text: (msg.text || {}).body || '',\n            inbound_at: new Date(Number(msg.timestamp) * 1000).toISOString()\n          }\n        });\n      }\n    }\n  }\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "ea-window",
+      "name": "Record Inbound (window-tracker)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        560,
+        60
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_WINDOW_TRACKER_WORKFLOW_ID",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "wa_id": "={{ $json.wa_id }}",
+            "business_phone_id": "={{ $json.business_phone_id }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "ea-consent",
+      "name": "Consent Keyword Check (optin-optout)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        780,
+        60
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_OPTIN_OPTOUT_WORKFLOW_ID",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "wa_id": "={{ $('Parse Inbound').item.json.wa_id }}",
+            "business_phone_id": "={{ $('Parse Inbound').item.json.business_phone_id }}",
+            "text": "={{ $('Parse Inbound').item.json.text }}",
+            "wamid": "={{ $('Parse Inbound').item.json.wamid }}",
+            "inbound_at": "={{ $('Parse Inbound').item.json.inbound_at }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "ea-getwindow",
+      "name": "Get Window State",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1000,
+        60
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_WINDOW_TRACKER_WORKFLOW_ID",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "wa_id": "={{ $('Parse Inbound').item.json.wa_id }}",
+            "business_phone_id": "={{ $('Parse Inbound').item.json.business_phone_id }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "ea-optedout",
+      "name": "Opted Out Or Consent Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1220,
+        60
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ea-optedout-c1",
+              "leftValue": "={{ $json.opted_out === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "ea-stop",
+      "name": "Stop - Do Not Reply",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        -60
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "ea-agent",
+      "name": "AI Support Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1440,
+        200
+      ],
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $('Parse Inbound').item.json.text }}",
+        "options": {
+          "systemMessage": "You are the support assistant for Example Widgets Ltd on WhatsApp.\n\nHard rules:\n- You are replying to someone who messaged us first. You never start conversations.\n- Never promise a discount, refund or delivery date you were not given in context.\n- If the customer asks to stop hearing from us, acknowledge it in one line and say nothing else; the opt-out is already recorded by the system.\n- Keep replies under 600 characters. Plain text. No markdown.\n- If you do not know something, say so and offer to have a human follow up.\n\nYou have no ability to send anything yourself. Your text goes through a compliance gate that may refuse it. That is expected and is not an error."
+        }
+      }
+    },
+    {
+      "id": "ea-model",
+      "name": "OpenAI Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        1400,
+        400
+      ],
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list"
+        },
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_WITH_YOUR_OPENAI_CRED_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "id": "ea-memory",
+      "name": "Conversation Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        1560,
+        400
+      ],
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Parse Inbound').item.json.wa_id }}",
+        "contextWindowLength": 10
+      }
+    },
+    {
+      "id": "ea-prep",
+      "name": "Prepare Send Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1660,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Build the send request for message-router. This node deliberately does NOT\n// decide anything - it only shapes the request. The gate lives in\n// message-router, and the same core is embedded here so this workflow can\n// pre-flight the decision and tell the model whether it must pick a template.\n// Generated from logic/gate.js by tools/build_workflows.py.\nvar WINDOW_SECONDS = 86400; // 24 hours. Verified: Meta send-messages guide.\n\n// Template categories Meta actually defines. \"SERVICE\" is NOT a template\n// category - service messages are the free-form messages you may send while a\n// customer service window is open.\nvar TEMPLATE_CATEGORIES = [\"AUTHENTICATION\", \"MARKETING\", \"UTILITY\"];\n\n// UNVERIFIED against Meta docs: WhatsApp does not publish a mandated STOP\n// keyword list the way SMS carriers do. This list is this kit's own convention\n// for honoring \"clear instructions for how people can opt out\". Extend it for\n// your own markets - it is deliberately conservative, because a false opt-out\n// is cheaper than an ignored one.\nvar STOP_KEYWORDS = [\n  \"stop\",\n  \"unsubscribe\",\n  \"cancel\",\n  \"end\",\n  \"quit\",\n  \"optout\",\n  \"opt out\",\n  \"baja\",\n  \"parar\",\n  \"cancelar\",\n  \"detener\",\n  \"arret\",\n  \"arreter\",\n  \"desabonner\",\n  \"stopp\",\n  \"abmelden\",\n  \"beenden\",\n  \"sair\",\n  \"cancelar tudo\",\n  \"berhenti\",\n  \"henti\",\n  \"basta\",\n  \"annulla\",\n  \"stop tout\",\n];\n\nfunction normalizeText(value) {\n  if (typeof value !== \"string\") {\n    return \"\";\n  }\n  return value\n    .toLowerCase()\n    .replace(/[^a-z0-9 ]+/g, \" \")\n    .replace(/\\s+/g, \" \")\n    .trim();\n}\n\n// True only when the whole message is an opt-out instruction. A message that\n// merely contains the word \"stop\" (\"stop by tomorrow\") is not an opt-out.\nfunction isOptOutMessage(text) {\n  var normalized = normalizeText(text);\n  if (!normalized) {\n    return false;\n  }\n  for (var i = 0; i < STOP_KEYWORDS.length; i++) {\n    if (normalized === STOP_KEYWORDS[i]) {\n      return true;\n    }\n  }\n  return false;\n}\n\nfunction toEpochSeconds(value) {\n  if (value === null || value === undefined || value === \"\") {\n    return null;\n  }\n  if (typeof value === \"number\") {\n    return Math.floor(value > 1e12 ? value / 1000 : value);\n  }\n  var parsed = Date.parse(value);\n  if (isNaN(parsed)) {\n    return null;\n  }\n  return Math.floor(parsed / 1000);\n}\n\n// The customer service window: opens/resets on every inbound user message or\n// call and lasts 24h. Exactly 24h elapsed counts as CLOSED - the boundary is\n// treated conservatively so a one-second clock skew cannot produce an\n// out-of-window free-form send.\nfunction windowState(input) {\n  var now = toEpochSeconds(input && input.now);\n  var last = toEpochSeconds(input && input.lastInboundAt);\n  if (now === null) {\n    throw new Error(\"windowState: now is required\");\n  }\n  if (last === null) {\n    return {\n      open: false,\n      elapsedSeconds: null,\n      secondsRemaining: 0,\n      everContacted: false,\n    };\n  }\n  var elapsed = now - last;\n  if (elapsed < 0) {\n    elapsed = 0;\n  } // future timestamp = clock skew, treat as just now\n  var open = elapsed < WINDOW_SECONDS;\n  return {\n    open: open,\n    elapsedSeconds: elapsed,\n    secondsRemaining: open ? WINDOW_SECONDS - elapsed : 0,\n    everContacted: true,\n  };\n}\n\nfunction rateState(input) {\n  var sent24h = Number((input && input.sent24h) || 0);\n  var dailyCap = Number((input && input.dailyCap) || 0);\n  var sentBurstWindow = Number((input && input.sentBurstWindow) || 0);\n  var burstCap = Number((input && input.burstCap) || 0);\n  var dailyExhausted = dailyCap > 0 && sent24h >= dailyCap;\n  var burstExhausted = burstCap > 0 && sentBurstWindow >= burstCap;\n  return {\n    dailyExhausted: dailyExhausted,\n    burstExhausted: burstExhausted,\n    dailyRemaining: dailyCap > 0 ? Math.max(0, dailyCap - sent24h) : null,\n    burstRemaining:\n      burstCap > 0 ? Math.max(0, burstCap - sentBurstWindow) : null,\n  };\n}\n\nfunction deny(code, reason, extra) {\n  var out = {\n    allow: false,\n    action: \"block\",\n    code: code,\n    reason: reason,\n    requiresTemplate: false,\n  };\n  if (extra) {\n    for (var k in extra) {\n      if (Object.prototype.hasOwnProperty.call(extra, k)) {\n        out[k] = extra[k];\n      }\n    }\n  }\n  return out;\n}\n\n/*\n * evaluateSend - the single gate every outbound message must pass.\n *\n * request: {\n *   now, lastInboundAt,\n *   optedOut, optedOutAt, optInAt, marketingOptIn,\n *   messageType: 'freeform' | 'template',\n *   templateName, templateStatus, templateCategory,\n *   sent24h, dailyCap, sentBurstWindow, burstCap,\n *   circuitBreakerOpen, circuitBreakerReason\n * }\n *\n * Returns { allow, action, code, reason, window, rate, messageType }.\n * action is one of: 'send_freeform' | 'send_template' | 'block'.\n * A refusal is never silent: the caller MUST log every allow:false result.\n */\nfunction evaluateSend(request) {\n  var req = request || {};\n  var win = windowState({ now: req.now, lastInboundAt: req.lastInboundAt });\n  var rate = rateState(req);\n  var messageType = req.messageType === \"template\" ? \"template\" : \"freeform\";\n  var context = { window: win, rate: rate, messageType: messageType };\n\n  // 1. Circuit breaker - quality degraded, all outbound halted.\n  if (req.circuitBreakerOpen === true) {\n    return deny(\n      \"CIRCUIT_BREAKER_OPEN\",\n      \"Outbound halted by the quality circuit breaker: \" +\n        (req.circuitBreakerReason || \"unspecified\"),\n      context,\n    );\n  }\n\n  // 2. Opt-out is absolute and applies inside the window too. Reversible only\n  // by an explicit new opt-in event written to the ledger.\n  if (req.optedOut === true) {\n    return deny(\n      \"OPTED_OUT\",\n      \"Contact opted out at \" +\n        (req.optedOutAt || \"unknown time\") +\n        \". Sending requires a new explicit opt-in.\",\n      context,\n    );\n  }\n\n  // 3. Rate limits, checked before the window so a burst cannot be laundered\n  // through an open window.\n  if (rate.dailyExhausted) {\n    return deny(\n      \"DAILY_CAP_REACHED\",\n      \"Daily send cap reached (\" +\n        Number(req.sent24h || 0) +\n        \"/\" +\n        Number(req.dailyCap || 0) +\n        \").\",\n      context,\n    );\n  }\n  if (rate.burstExhausted) {\n    return deny(\n      \"BURST_CAP_REACHED\",\n      \"Burst cap reached (\" +\n        Number(req.sentBurstWindow || 0) +\n        \"/\" +\n        Number(req.burstCap || 0) +\n        \" in the burst window).\",\n      context,\n    );\n  }\n\n  // 4. Window open -> free-form service messages are allowed.\n  if (win.open) {\n    if (messageType === \"template\") {\n      if (req.templateStatus !== \"APPROVED\") {\n        return deny(\n          \"TEMPLATE_NOT_APPROVED\",\n          \"Template \" +\n            (req.templateName || \"(unnamed)\") +\n            \" has status \" +\n            (req.templateStatus || \"UNKNOWN\") +\n            \", not APPROVED.\",\n          context,\n        );\n      }\n      return {\n        allow: true,\n        action: \"send_template\",\n        code: \"OK_TEMPLATE_IN_WINDOW\",\n        reason: \"Window open; approved template.\",\n        requiresTemplate: false,\n        window: win,\n        rate: rate,\n        messageType: messageType,\n      };\n    }\n    return {\n      allow: true,\n      action: \"send_freeform\",\n      code: \"OK_WINDOW_OPEN\",\n      reason:\n        \"Customer service window open, \" +\n        win.secondsRemaining +\n        \"s remaining.\",\n      requiresTemplate: false,\n      window: win,\n      rate: rate,\n      messageType: messageType,\n    };\n  }\n\n  // 5. Window closed. Business-initiated territory: opt-in is mandatory.\n  if (toEpochSeconds(req.optInAt) === null) {\n    return deny(\n      \"NO_OPT_IN\",\n      \"No opt-in on record and the customer service window is closed. Business-initiated messages require opt-in.\",\n      context,\n    );\n  }\n\n  if (messageType !== \"template\") {\n    var refusal = deny(\n      \"TEMPLATE_REQUIRED\",\n      \"Customer service window closed\" +\n        (win.everContacted\n          ? \" (\" + win.elapsedSeconds + \"s since last inbound)\"\n          : \" (no inbound on record)\") +\n        \". Free-form messages outside the window are a policy violation - send an approved template instead.\",\n      context,\n    );\n    refusal.requiresTemplate = true;\n    return refusal;\n  }\n\n  if (req.templateStatus !== \"APPROVED\") {\n    return deny(\n      \"TEMPLATE_NOT_APPROVED\",\n      \"Template \" +\n        (req.templateName || \"(unnamed)\") +\n        \" has status \" +\n        (req.templateStatus || \"UNKNOWN\") +\n        \", not APPROVED.\",\n      context,\n    );\n  }\n\n  var category = String(req.templateCategory || \"\").toUpperCase();\n  if (TEMPLATE_CATEGORIES.indexOf(category) === -1) {\n    return deny(\n      \"TEMPLATE_CATEGORY_INVALID\",\n      \"Template category \" +\n        (req.templateCategory || \"(none)\") +\n        \" is not one of \" +\n        TEMPLATE_CATEGORIES.join(\", \") +\n        \".\",\n      context,\n    );\n  }\n\n  // Marketing needs marketing-specific consent. UNVERIFIED as a separate,\n  // explicit Meta requirement: Meta requires opt-in and requires honoring\n  // opt-out \"for specific categories of messages\". This kit enforces a distinct\n  // marketing consent flag because that is the safe reading.\n  if (category === \"MARKETING\" && req.marketingOptIn !== true) {\n    return deny(\n      \"NO_MARKETING_OPT_IN\",\n      \"MARKETING template requested but the contact has no marketing opt-in on record.\",\n      context,\n    );\n  }\n\n  return {\n    allow: true,\n    action: \"send_template\",\n    code: \"OK_TEMPLATE_OUT_OF_WINDOW\",\n    reason:\n      \"Window closed; approved \" +\n      category +\n      \" template with opt-in on record.\",\n    requiresTemplate: false,\n    window: win,\n    rate: rate,\n    messageType: messageType,\n  };\n}\n\n// ------------------------- n8n adapter -------------------------\nconst inbound = $('Parse Inbound').first().json;\nconst windowInfo = $('Get Window State').first().json || {};\nconst reply = String(($input.first().json || {}).output || '').trim();\n\n// Pre-flight with the same logic the router will apply. If this says the window\n// is closed, the agent must not send its free-form reply - it has to fall back\n// to an approved template (or to nothing at all).\nconst preflight = evaluateSend({\n  now: new Date().toISOString(),\n  lastInboundAt: windowInfo.last_inbound_at || inbound.inbound_at,\n  optedOut: windowInfo.opted_out === true,\n  optInAt: windowInfo.opted_in === true ? (windowInfo.opted_in_at || null) : null,\n  messageType: 'freeform',\n  sent24h: 0,\n  dailyCap: 0,\n  sentBurstWindow: 0,\n  burstCap: 0\n});\n\nconst useTemplate = preflight.requiresTemplate === true;\n\nreturn [{\n  json: {\n    wa_id: inbound.wa_id,\n    business_phone_id: inbound.business_phone_id,\n    message_type: useTemplate ? 'template' : 'freeform',\n    body: reply,\n    // Replace with a template you have actually had approved.\n    template_name: useTemplate ? 'appointment_reminder_v3' : null,\n    template_category: useTemplate ? 'UTILITY' : null,\n    template_language: 'en_US',\n    template_status: useTemplate ? 'APPROVED' : null,\n    template_components: [],\n    daily_cap: 800,\n    burst_cap: 20,\n    preflight_code: preflight.code,\n    preflight_reason: preflight.reason\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "ea-rate",
+      "name": "Rate Check (rate-limiter)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1880,
+        200
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_RATE_LIMITER_WORKFLOW_ID",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "wa_id": "={{ $json.wa_id }}",
+            "business_phone_id": "={{ $json.business_phone_id }}",
+            "tier": "TIER_250",
+            "self_imposed_daily_unique_recipients": "={{ 150 }}",
+            "self_imposed_daily_total_messages": "={{ 800 }}",
+            "burst_max_messages_per_window": "={{ 20 }}",
+            "min_seconds_between_messages_per_contact": "={{ 15 }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "ea-rateok",
+      "name": "Rate OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2100,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ea-rateok-c1",
+              "leftValue": "={{ $json.allow }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "ea-router",
+      "name": "Send (message-router)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        2320,
+        120
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_MESSAGE_ROUTER_WORKFLOW_ID",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "wa_id": "={{ $('Prepare Send Request').item.json.wa_id }}",
+            "business_phone_id": "={{ $('Prepare Send Request').item.json.business_phone_id }}",
+            "message_type": "={{ $('Prepare Send Request').item.json.message_type }}",
+            "body": "={{ $('Prepare Send Request').item.json.body }}",
+            "template_name": "={{ $('Prepare Send Request').item.json.template_name }}",
+            "template_category": "={{ $('Prepare Send Request').item.json.template_category }}",
+            "template_language": "={{ $('Prepare Send Request').item.json.template_language }}",
+            "template_status": "={{ $('Prepare Send Request').item.json.template_status }}",
+            "daily_cap": "={{ 800 }}",
+            "burst_cap": "={{ 20 }}"
+          }
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "ea-sent",
+      "name": "Reply Delivered To Gate",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2540,
+        120
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "ea-ratestop",
+      "name": "Held By Rate Limiter",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2320,
+        320
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "WhatsApp Inbound": {
+      "main": [
+        [
+          {
+            "node": "Parse Inbound",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Inbound": {
+      "main": [
+        [
+          {
+            "node": "Record Inbound (window-tracker)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Inbound (window-tracker)": {
+      "main": [
+        [
+          {
+            "node": "Consent Keyword Check (optin-optout)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consent Keyword Check (optin-optout)": {
+      "main": [
+        [
+          {
+            "node": "Get Window State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Window State": {
+      "main": [
+        [
+          {
+            "node": "Opted Out Or Consent Event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Opted Out Or Consent Event?": {
+      "main": [
+        [
+          {
+            "node": "Stop - Do Not Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Support Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Support Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Conversation Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Support Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Support Agent": {
+      "main": [
+        [
+          {
+            "node": "Prepare Send Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Send Request": {
+      "main": [
+        [
+          {
+            "node": "Rate Check (rate-limiter)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rate Check (rate-limiter)": {
+      "main": [
+        [
+          {
+            "node": "Rate OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rate OK?": {
+      "main": [
+        [
+          {
+            "node": "Send (message-router)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Held By Rate Limiter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send (message-router)": {
+      "main": [
+        [
+          {
+            "node": "Reply Delivered To Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "name": "whatsapp-compliance"
+    }
+  ]
+}

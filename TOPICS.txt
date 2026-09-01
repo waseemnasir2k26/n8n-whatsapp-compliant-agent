@@ -1,0 +1,1 @@
+n8n, whatsapp, whatsapp-business-api, whatsapp-cloud-api, compliance, guardrails, opt-in, opt-out, rate-limiting, circuit-breaker, ai-agent, automation, postgres, messaging, consent-management, chatbot

@@ -1,0 +1,274 @@
+{
+  "name": "window-tracker",
+  "nodes": [
+    {
+      "id": "wt-note",
+      "name": "Note wt-note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        -160
+      ],
+      "parameters": {
+        "content": "## window-tracker\n\nWrites the 24h customer service window state.\n\nTop lane: Meta inbound webhook -> reset window -> log.\nBottom lane: called by other workflows to READ window state.\n\nWindow rule verified against\nhttps://developers.facebook.com/docs/whatsapp/cloud-api/guides/send-messages",
+        "width": 520,
+        "height": 300,
+        "color": 4
+      }
+    },
+    {
+      "id": "wt-webhook",
+      "name": "Meta Inbound Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        140,
+        -60
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wa/inbound",
+        "responseMode": "lastNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "webhookId": "11111111-1111-4111-8111-111111111111"
+    },
+    {
+      "id": "wt-parse",
+      "name": "Parse Inbound Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        360,
+        -60
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Parse a WhatsApp Cloud API inbound webhook payload.\n// Meta batches entries; one inbound webhook can carry several messages.\n// Reference: https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/reference/messages\nconst out = [];\nfor (const item of $input.all()) {\n  const body = item.json.body || item.json;\n  const entries = body.entry || [];\n  for (const entry of entries) {\n    for (const change of (entry.changes || [])) {\n      const value = (change || {}).value || {};\n      const meta = value.metadata || {};\n      const contacts = value.contacts || [];\n      for (const msg of (value.messages || [])) {\n        const profile = contacts.find(function (c) { return c.wa_id === msg.from; }) || {};\n        out.push({\n          json: {\n            wa_id: msg.from,\n            business_phone_id: meta.phone_number_id || '',\n            display_name: (profile.profile || {}).name || null,\n            wamid: msg.id,\n            message_type: msg.type,\n            text: (msg.text || {}).body || '',\n            // Meta sends a unix timestamp in seconds as a string.\n            inbound_at: new Date(Number(msg.timestamp) * 1000).toISOString()\n          }\n        });\n      }\n      // A call also opens/resets the customer service window. Verified:\n      // https://developers.facebook.com/docs/whatsapp/cloud-api/guides/send-messages\n      for (const call of (value.calls || [])) {\n        out.push({\n          json: {\n            wa_id: call.from,\n            business_phone_id: meta.phone_number_id || '',\n            display_name: null,\n            wamid: call.id || null,\n            message_type: 'call',\n            text: '',\n            inbound_at: new Date(Number(call.timestamp || Date.now() / 1000) * 1000).toISOString()\n          }\n        });\n      }\n    }\n  }\n}\nif (out.length === 0) {\n  // Status callbacks and other fields land here. Not an error, just nothing to do.\n  return [];\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "wt-upsert",
+      "name": "Upsert Contact And Reset Window",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        580,
+        -60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Reset the 24h customer service window on every inbound message or call.\nINSERT INTO wa.contacts (wa_id, business_phone_id, display_name, last_inbound_at)\nVALUES ('{{ $json.wa_id }}', '{{ $json.business_phone_id }}',\n        NULLIF('{{ $json.display_name }}', 'null'), '{{ $json.inbound_at }}'::timestamptz)\nON CONFLICT (business_phone_id, wa_id) DO UPDATE\nSET last_inbound_at = GREATEST(wa.contacts.last_inbound_at, EXCLUDED.last_inbound_at),\n    display_name    = COALESCE(EXCLUDED.display_name, wa.contacts.display_name),\n    updated_at      = now()\nRETURNING id AS contact_id, wa_id, business_phone_id, last_inbound_at;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "wt-log",
+      "name": "Log Inbound Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        800,
+        -60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wa.message_log\n  (contact_id, wa_id, business_phone_id, direction, message_type, wamid, body_preview,\n   gate_code, gate_reason, window_open, window_remaining_s)\nVALUES\n  ({{ $json.contact_id }}, '{{ $json.wa_id }}', '{{ $json.business_phone_id }}',\n   'inbound', 'freeform', {{ $json.wamid ? \"'\" + $json.wamid + \"'\" : 'NULL' }},\n   left({{ JSON.stringify($('Parse Inbound Payload').item.json.text) }}, 160),\n   'INBOUND_WINDOW_RESET', 'Inbound message or call reset the 24h window',\n   TRUE, 86400)\nON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "wt-done",
+      "name": "Inbound Recorded",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        -60
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "wt-sub",
+      "name": "Called By Another Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        140,
+        200
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "wa_id",
+              "type": "string"
+            },
+            {
+              "name": "business_phone_id",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "wt-read",
+      "name": "Read Window State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        360,
+        200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT contact_id, wa_id, business_phone_id, last_inbound_at,\n       window_open, window_remaining_s,\n       opted_in, opted_in_at, marketing_opted_in, opted_out, opted_out_at\nFROM wa.contact_gate_state\nWHERE business_phone_id = '{{ $json.business_phone_id }}'\n  AND wa_id = '{{ $json.wa_id }}';",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "wt-compute",
+      "name": "Compute Window State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Answer the question every other workflow asks this one:\n// is the customer service window open, and for how much longer?\n// The database view already computes it; we recompute here so the answer is\n// identical whether the row exists or not, and so a caller that passes a\n// synthetic 'now' (tests, replays) gets the same shape back.\nconst WINDOW_SECONDS = 86400; // https://developers.facebook.com/docs/whatsapp/cloud-api/guides/send-messages\nconst results = [];\nfor (const item of $input.all()) {\n  const row = item.json || {};\n  const last = row.last_inbound_at ? Date.parse(row.last_inbound_at) : null;\n  const now = Date.now();\n  let elapsed = last === null ? null : Math.floor((now - last) / 1000);\n  if (elapsed !== null && elapsed < 0) { elapsed = 0; }\n  const open = elapsed !== null && elapsed < WINDOW_SECONDS;\n  results.push({\n    json: {\n      wa_id: row.wa_id || null,\n      business_phone_id: row.business_phone_id || null,\n      known_contact: Boolean(row.contact_id),\n      window_open: open,\n      seconds_remaining: open ? (WINDOW_SECONDS - elapsed) : 0,\n      seconds_since_last_inbound: elapsed,\n      last_inbound_at: row.last_inbound_at || null,\n      opted_in: row.opted_in === true,\n      marketing_opted_in: row.marketing_opted_in === true,\n      opted_out: row.opted_out === true,\n      opted_out_at: row.opted_out_at || null,\n      // If the window is closed, the only legal outbound is an approved template.\n      template_required: !open\n    }\n  });\n}\nreturn results;\n"
+      }
+    },
+    {
+      "id": "wt-return",
+      "name": "Return Window State",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        800,
+        200
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Meta Inbound Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse Inbound Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Inbound Payload": {
+      "main": [
+        [
+          {
+            "node": "Upsert Contact And Reset Window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Contact And Reset Window": {
+      "main": [
+        [
+          {
+            "node": "Log Inbound Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Inbound Message": {
+      "main": [
+        [
+          {
+            "node": "Inbound Recorded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Called By Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Read Window State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Window State": {
+      "main": [
+        [
+          {
+            "node": "Compute Window State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Window State": {
+      "main": [
+        [
+          {
+            "node": "Return Window State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "name": "whatsapp-compliance"
+    }
+  ]
+}

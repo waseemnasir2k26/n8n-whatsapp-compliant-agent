@@ -1,0 +1,445 @@
+{
+  "name": "message-router",
+  "nodes": [
+    {
+      "id": "mr-note",
+      "name": "Note mr-note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -500,
+        -260
+      ],
+      "parameters": {
+        "content": "## message-router - THE GATE\n\nEvery outbound message goes through here. Nothing calls the Cloud API directly.\n\nWindow open  -> free-form service message allowed.\nWindow closed -> approved template only, otherwise REFUSE and log.\n\nVerified: 'When the window closes, you can only send pre-approved template messages.'\nhttps://developers.facebook.com/docs/whatsapp/cloud-api/guides/send-messages",
+        "width": 560,
+        "height": 320,
+        "color": 4
+      }
+    },
+    {
+      "id": "mr-in",
+      "name": "Send Request In",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        140,
+        60
+      ],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "wa_id",
+              "type": "string"
+            },
+            {
+              "name": "business_phone_id",
+              "type": "string"
+            },
+            {
+              "name": "message_type",
+              "type": "string"
+            },
+            {
+              "name": "body",
+              "type": "string"
+            },
+            {
+              "name": "template_name",
+              "type": "string"
+            },
+            {
+              "name": "template_category",
+              "type": "string"
+            },
+            {
+              "name": "template_language",
+              "type": "string"
+            },
+            {
+              "name": "template_status",
+              "type": "string"
+            },
+            {
+              "name": "daily_cap",
+              "type": "number"
+            },
+            {
+              "name": "burst_cap",
+              "type": "number"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "mr-load",
+      "name": "Load Gate State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        360,
+        60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One read: window state, consent, counters, breaker.\nSELECT\n  g.contact_id, g.wa_id, g.business_phone_id, g.last_inbound_at,\n  g.window_open, g.window_remaining_s,\n  g.opted_in, g.opted_in_at, g.marketing_opted_in, g.opted_out, g.opted_out_at,\n  COALESCE(s.sent_24h, 0)            AS sent_24h,\n  COALESCE(s.sent_burst_window, 0)   AS sent_burst_window,\n  COALESCE(b.open, FALSE)            AS breaker_open,\n  b.reason                           AS breaker_reason\nFROM wa.contact_gate_state g\nLEFT JOIN wa.send_counters   s ON s.business_phone_id = g.business_phone_id\nLEFT JOIN wa.circuit_breaker b ON b.business_phone_id = g.business_phone_id\nWHERE g.business_phone_id = '{{ $json.business_phone_id }}'\n  AND g.wa_id = '{{ $json.wa_id }}';",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "mr-gate",
+      "name": "Compliance Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        580,
+        60
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ===========================================================\n// COMPLIANCE GATE - generated from logic/gate.js by\n// tools/build_workflows.py. Do not edit here; edit logic/gate.js\n// and re-run the generator. tests/parity.test.js enforces this.\n// ===========================================================\nvar WINDOW_SECONDS = 86400; // 24 hours. Verified: Meta send-messages guide.\n\n// Template categories Meta actually defines. \"SERVICE\" is NOT a template\n// category - service messages are the free-form messages you may send while a\n// customer service window is open.\nvar TEMPLATE_CATEGORIES = [\"AUTHENTICATION\", \"MARKETING\", \"UTILITY\"];\n\n// UNVERIFIED against Meta docs: WhatsApp does not publish a mandated STOP\n// keyword list the way SMS carriers do. This list is this kit's own convention\n// for honoring \"clear instructions for how people can opt out\". Extend it for\n// your own markets - it is deliberately conservative, because a false opt-out\n// is cheaper than an ignored one.\nvar STOP_KEYWORDS = [\n  \"stop\",\n  \"unsubscribe\",\n  \"cancel\",\n  \"end\",\n  \"quit\",\n  \"optout\",\n  \"opt out\",\n  \"baja\",\n  \"parar\",\n  \"cancelar\",\n  \"detener\",\n  \"arret\",\n  \"arreter\",\n  \"desabonner\",\n  \"stopp\",\n  \"abmelden\",\n  \"beenden\",\n  \"sair\",\n  \"cancelar tudo\",\n  \"berhenti\",\n  \"henti\",\n  \"basta\",\n  \"annulla\",\n  \"stop tout\",\n];\n\nfunction normalizeText(value) {\n  if (typeof value !== \"string\") {\n    return \"\";\n  }\n  return value\n    .toLowerCase()\n    .replace(/[^a-z0-9 ]+/g, \" \")\n    .replace(/\\s+/g, \" \")\n    .trim();\n}\n\n// True only when the whole message is an opt-out instruction. A message that\n// merely contains the word \"stop\" (\"stop by tomorrow\") is not an opt-out.\nfunction isOptOutMessage(text) {\n  var normalized = normalizeText(text);\n  if (!normalized) {\n    return false;\n  }\n  for (var i = 0; i < STOP_KEYWORDS.length; i++) {\n    if (normalized === STOP_KEYWORDS[i]) {\n      return true;\n    }\n  }\n  return false;\n}\n\nfunction toEpochSeconds(value) {\n  if (value === null || value === undefined || value === \"\") {\n    return null;\n  }\n  if (typeof value === \"number\") {\n    return Math.floor(value > 1e12 ? value / 1000 : value);\n  }\n  var parsed = Date.parse(value);\n  if (isNaN(parsed)) {\n    return null;\n  }\n  return Math.floor(parsed / 1000);\n}\n\n// The customer service window: opens/resets on every inbound user message or\n// call and lasts 24h. Exactly 24h elapsed counts as CLOSED - the boundary is\n// treated conservatively so a one-second clock skew cannot produce an\n// out-of-window free-form send.\nfunction windowState(input) {\n  var now = toEpochSeconds(input && input.now);\n  var last = toEpochSeconds(input && input.lastInboundAt);\n  if (now === null) {\n    throw new Error(\"windowState: now is required\");\n  }\n  if (last === null) {\n    return {\n      open: false,\n      elapsedSeconds: null,\n      secondsRemaining: 0,\n      everContacted: false,\n    };\n  }\n  var elapsed = now - last;\n  if (elapsed < 0) {\n    elapsed = 0;\n  } // future timestamp = clock skew, treat as just now\n  var open = elapsed < WINDOW_SECONDS;\n  return {\n    open: open,\n    elapsedSeconds: elapsed,\n    secondsRemaining: open ? WINDOW_SECONDS - elapsed : 0,\n    everContacted: true,\n  };\n}\n\nfunction rateState(input) {\n  var sent24h = Number((input && input.sent24h) || 0);\n  var dailyCap = Number((input && input.dailyCap) || 0);\n  var sentBurstWindow = Number((input && input.sentBurstWindow) || 0);\n  var burstCap = Number((input && input.burstCap) || 0);\n  var dailyExhausted = dailyCap > 0 && sent24h >= dailyCap;\n  var burstExhausted = burstCap > 0 && sentBurstWindow >= burstCap;\n  return {\n    dailyExhausted: dailyExhausted,\n    burstExhausted: burstExhausted,\n    dailyRemaining: dailyCap > 0 ? Math.max(0, dailyCap - sent24h) : null,\n    burstRemaining:\n      burstCap > 0 ? Math.max(0, burstCap - sentBurstWindow) : null,\n  };\n}\n\nfunction deny(code, reason, extra) {\n  var out = {\n    allow: false,\n    action: \"block\",\n    code: code,\n    reason: reason,\n    requiresTemplate: false,\n  };\n  if (extra) {\n    for (var k in extra) {\n      if (Object.prototype.hasOwnProperty.call(extra, k)) {\n        out[k] = extra[k];\n      }\n    }\n  }\n  return out;\n}\n\n/*\n * evaluateSend - the single gate every outbound message must pass.\n *\n * request: {\n *   now, lastInboundAt,\n *   optedOut, optedOutAt, optInAt, marketingOptIn,\n *   messageType: 'freeform' | 'template',\n *   templateName, templateStatus, templateCategory,\n *   sent24h, dailyCap, sentBurstWindow, burstCap,\n *   circuitBreakerOpen, circuitBreakerReason\n * }\n *\n * Returns { allow, action, code, reason, window, rate, messageType }.\n * action is one of: 'send_freeform' | 'send_template' | 'block'.\n * A refusal is never silent: the caller MUST log every allow:false result.\n */\nfunction evaluateSend(request) {\n  var req = request || {};\n  var win = windowState({ now: req.now, lastInboundAt: req.lastInboundAt });\n  var rate = rateState(req);\n  var messageType = req.messageType === \"template\" ? \"template\" : \"freeform\";\n  var context = { window: win, rate: rate, messageType: messageType };\n\n  // 1. Circuit breaker - quality degraded, all outbound halted.\n  if (req.circuitBreakerOpen === true) {\n    return deny(\n      \"CIRCUIT_BREAKER_OPEN\",\n      \"Outbound halted by the quality circuit breaker: \" +\n        (req.circuitBreakerReason || \"unspecified\"),\n      context,\n    );\n  }\n\n  // 2. Opt-out is absolute and applies inside the window too. Reversible only\n  // by an explicit new opt-in event written to the ledger.\n  if (req.optedOut === true) {\n    return deny(\n      \"OPTED_OUT\",\n      \"Contact opted out at \" +\n        (req.optedOutAt || \"unknown time\") +\n        \". Sending requires a new explicit opt-in.\",\n      context,\n    );\n  }\n\n  // 3. Rate limits, checked before the window so a burst cannot be laundered\n  // through an open window.\n  if (rate.dailyExhausted) {\n    return deny(\n      \"DAILY_CAP_REACHED\",\n      \"Daily send cap reached (\" +\n        Number(req.sent24h || 0) +\n        \"/\" +\n        Number(req.dailyCap || 0) +\n        \").\",\n      context,\n    );\n  }\n  if (rate.burstExhausted) {\n    return deny(\n      \"BURST_CAP_REACHED\",\n      \"Burst cap reached (\" +\n        Number(req.sentBurstWindow || 0) +\n        \"/\" +\n        Number(req.burstCap || 0) +\n        \" in the burst window).\",\n      context,\n    );\n  }\n\n  // 4. Window open -> free-form service messages are allowed.\n  if (win.open) {\n    if (messageType === \"template\") {\n      if (req.templateStatus !== \"APPROVED\") {\n        return deny(\n          \"TEMPLATE_NOT_APPROVED\",\n          \"Template \" +\n            (req.templateName || \"(unnamed)\") +\n            \" has status \" +\n            (req.templateStatus || \"UNKNOWN\") +\n            \", not APPROVED.\",\n          context,\n        );\n      }\n      return {\n        allow: true,\n        action: \"send_template\",\n        code: \"OK_TEMPLATE_IN_WINDOW\",\n        reason: \"Window open; approved template.\",\n        requiresTemplate: false,\n        window: win,\n        rate: rate,\n        messageType: messageType,\n      };\n    }\n    return {\n      allow: true,\n      action: \"send_freeform\",\n      code: \"OK_WINDOW_OPEN\",\n      reason:\n        \"Customer service window open, \" +\n        win.secondsRemaining +\n        \"s remaining.\",\n      requiresTemplate: false,\n      window: win,\n      rate: rate,\n      messageType: messageType,\n    };\n  }\n\n  // 5. Window closed. Business-initiated territory: opt-in is mandatory.\n  if (toEpochSeconds(req.optInAt) === null) {\n    return deny(\n      \"NO_OPT_IN\",\n      \"No opt-in on record and the customer service window is closed. Business-initiated messages require opt-in.\",\n      context,\n    );\n  }\n\n  if (messageType !== \"template\") {\n    var refusal = deny(\n      \"TEMPLATE_REQUIRED\",\n      \"Customer service window closed\" +\n        (win.everContacted\n          ? \" (\" + win.elapsedSeconds + \"s since last inbound)\"\n          : \" (no inbound on record)\") +\n        \". Free-form messages outside the window are a policy violation - send an approved template instead.\",\n      context,\n    );\n    refusal.requiresTemplate = true;\n    return refusal;\n  }\n\n  if (req.templateStatus !== \"APPROVED\") {\n    return deny(\n      \"TEMPLATE_NOT_APPROVED\",\n      \"Template \" +\n        (req.templateName || \"(unnamed)\") +\n        \" has status \" +\n        (req.templateStatus || \"UNKNOWN\") +\n        \", not APPROVED.\",\n      context,\n    );\n  }\n\n  var category = String(req.templateCategory || \"\").toUpperCase();\n  if (TEMPLATE_CATEGORIES.indexOf(category) === -1) {\n    return deny(\n      \"TEMPLATE_CATEGORY_INVALID\",\n      \"Template category \" +\n        (req.templateCategory || \"(none)\") +\n        \" is not one of \" +\n        TEMPLATE_CATEGORIES.join(\", \") +\n        \".\",\n      context,\n    );\n  }\n\n  // Marketing needs marketing-specific consent. UNVERIFIED as a separate,\n  // explicit Meta requirement: Meta requires opt-in and requires honoring\n  // opt-out \"for specific categories of messages\". This kit enforces a distinct\n  // marketing consent flag because that is the safe reading.\n  if (category === \"MARKETING\" && req.marketingOptIn !== true) {\n    return deny(\n      \"NO_MARKETING_OPT_IN\",\n      \"MARKETING template requested but the contact has no marketing opt-in on record.\",\n      context,\n    );\n  }\n\n  return {\n    allow: true,\n    action: \"send_template\",\n    code: \"OK_TEMPLATE_OUT_OF_WINDOW\",\n    reason:\n      \"Window closed; approved \" +\n      category +\n      \" template with opt-in on record.\",\n    requiresTemplate: false,\n    window: win,\n    rate: rate,\n    messageType: messageType,\n  };\n}\n\n// ------------------------- n8n adapter -------------------------\nconst request = $('Send Request In').first().json;\nconst state = $input.first().json || {};\nconst decision = evaluateSend({\n  now: new Date().toISOString(),\n  lastInboundAt: state.last_inbound_at || null,\n  optedOut: state.opted_out === true,\n  optedOutAt: state.opted_out_at || null,\n  optInAt: state.opted_in === true ? (state.opted_in_at || null) : null,\n  marketingOptIn: state.marketing_opted_in === true,\n  messageType: request.message_type === 'template' ? 'template' : 'freeform',\n  templateName: request.template_name || null,\n  templateStatus: request.template_status || null,\n  templateCategory: request.template_category || null,\n  sent24h: Number(state.sent_24h || 0),\n  dailyCap: Number(request.daily_cap || 0),\n  sentBurstWindow: Number(state.sent_burst_window || 0),\n  burstCap: Number(request.burst_cap || 0),\n  circuitBreakerOpen: state.breaker_open === true,\n  circuitBreakerReason: state.breaker_reason || null\n});\n\nreturn [{\n  json: {\n    wa_id: request.wa_id,\n    business_phone_id: request.business_phone_id,\n    contact_id: state.contact_id || null,\n    body: request.body || '',\n    template_name: request.template_name || null,\n    template_category: request.template_category || null,\n    template_language: request.template_language || 'en_US',\n    template_components: request.template_components || [],\n    allow: decision.allow,\n    action: decision.action,\n    gate_code: decision.code,\n    gate_reason: decision.reason,\n    requires_template: decision.requiresTemplate === true,\n    window_open: decision.window.open,\n    window_remaining_s: decision.window.secondsRemaining,\n    message_type: decision.messageType,\n    decided_at: new Date().toISOString()\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "mr-allow",
+      "name": "Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        800,
+        60
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "mr-allow-c1",
+              "leftValue": "={{ $json.allow }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mr-istpl",
+      "name": "Template Send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1020,
+        -60
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "mr-istpl-c1",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "send_template",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mr-send-tpl",
+      "name": "Send Template Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1240,
+        -160
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v21.0/{{ $json.business_phone_id }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $json.wa_id }}\",\n  \"type\": \"template\",\n  \"template\": {\n    \"name\": \"{{ $json.template_name }}\",\n    \"language\": { \"code\": \"{{ $json.template_language }}\" },\n    \"components\": {{ JSON.stringify($json.template_components) }}\n  }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_HTTP_HEADER_CRED_ID",
+          "name": "WhatsApp Cloud API Token"
+        }
+      }
+    },
+    {
+      "id": "mr-send-free",
+      "name": "Send Free-form Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1240,
+        40
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v21.0/{{ $json.business_phone_id }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $json.wa_id }}\",\n  \"type\": \"text\",\n  \"text\": { \"preview_url\": false, \"body\": {{ JSON.stringify($json.body) }} }\n}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_HTTP_HEADER_CRED_ID",
+          "name": "WhatsApp Cloud API Token"
+        }
+      }
+    },
+    {
+      "id": "mr-log-out",
+      "name": "Log Outbound",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        1480,
+        -60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wa.message_log\n  (contact_id, wa_id, business_phone_id, direction, message_type, template_name,\n   template_category, wamid, body_preview, gate_code, gate_reason, window_open,\n   window_remaining_s)\nVALUES\n  ({{ $('Compliance Gate').item.json.contact_id || 'NULL' }},\n   '{{ $('Compliance Gate').item.json.wa_id }}',\n   '{{ $('Compliance Gate').item.json.business_phone_id }}',\n   'outbound',\n   '{{ $('Compliance Gate').item.json.message_type }}',\n   {{ $('Compliance Gate').item.json.template_name ? \"'\" + $('Compliance Gate').item.json.template_name + \"'\" : 'NULL' }},\n   {{ $('Compliance Gate').item.json.template_category ? \"'\" + $('Compliance Gate').item.json.template_category + \"'\" : 'NULL' }},\n   {{ $json.body && $json.body.messages && $json.body.messages[0] ? \"'\" + $json.body.messages[0].id + \"'\" : 'NULL' }},\n   left({{ JSON.stringify($('Compliance Gate').item.json.body) }}, 160),\n   '{{ $('Compliance Gate').item.json.gate_code }}',\n   {{ JSON.stringify($('Compliance Gate').item.json.gate_reason) }},\n   {{ $('Compliance Gate').item.json.window_open }},\n   {{ $('Compliance Gate').item.json.window_remaining_s }});",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "mr-sent",
+      "name": "Sent",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1700,
+        -60
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "mr-log-ref",
+      "name": "Log Refusal",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        1020,
+        240
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- A refusal is a row. Never a silent drop.\nINSERT INTO wa.message_log\n  (contact_id, wa_id, business_phone_id, direction, message_type, template_name,\n   template_category, wamid, body_preview, gate_code, gate_reason, window_open,\n   window_remaining_s)\nVALUES\n  ({{ $json.contact_id || 'NULL' }}, '{{ $json.wa_id }}', '{{ $json.business_phone_id }}',\n   'refused', 'none',\n   {{ $json.template_name ? \"'\" + $json.template_name + \"'\" : 'NULL' }},\n   {{ $json.template_category ? \"'\" + $json.template_category + \"'\" : 'NULL' }},\n   NULL,\n   left({{ JSON.stringify($json.body) }}, 160),\n   '{{ $json.gate_code }}', {{ JSON.stringify($json.gate_reason) }},\n   {{ $json.window_open }}, {{ $json.window_remaining_s }});",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_POSTGRES_CRED_ID",
+          "name": "WhatsApp Compliance Postgres"
+        }
+      }
+    },
+    {
+      "id": "mr-raise",
+      "name": "Refusal Is Loud",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        240
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Make the refusal impossible to ignore.\n// The n8n execution is marked as failed so it shows red in the executions list\n// and any error workflow you have configured fires. If you would rather the\n// caller handle refusals as data, set STOP_HARD to false - but keep the log\n// node above it either way.\nconst STOP_HARD = true;\nconst item = $input.first().json;\nconst message = 'WhatsApp send REFUSED [' + item.gate_code + '] to ' + item.wa_id + ': ' + item.gate_reason;\nif (STOP_HARD) {\n  throw new Error(message);\n}\nreturn [{ json: Object.assign({ refused: true, message: message }, item) }];\n"
+      }
+    }
+  ],
+  "connections": {
+    "Send Request In": {
+      "main": [
+        [
+          {
+            "node": "Load Gate State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Gate State": {
+      "main": [
+        [
+          {
+            "node": "Compliance Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compliance Gate": {
+      "main": [
+        [
+          {
+            "node": "Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Template Send?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Refusal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Template Send?": {
+      "main": [
+        [
+          {
+            "node": "Send Template Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Free-form Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Template Message": {
+      "main": [
+        [
+          {
+            "node": "Log Outbound",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Free-form Message": {
+      "main": [
+        [
+          {
+            "node": "Log Outbound",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Outbound": {
+      "main": [
+        [
+          {
+            "node": "Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Refusal": {
+      "main": [
+        [
+          {
+            "node": "Refusal Is Loud",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "name": "whatsapp-compliance"
+    }
+  ]
+}

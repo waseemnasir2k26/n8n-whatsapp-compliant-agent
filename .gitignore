@@ -1,0 +1,34 @@
+# Your real limits file names your real phone numbers. Never commit it.
+config/limits.yaml
+config/*.local.yaml
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# n8n exports that may contain credential ids or live data
+workflows/*.local.json
+exports/
+backup/
+
+# Node
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
