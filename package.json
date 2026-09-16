@@ -1,6 +1,6 @@
 {
   "name": "n8n-whatsapp-compliant-agent",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "n8n starter kit for a WhatsApp Business API AI agent where the compliance guardrails are the product.",
   "license": "MIT",
   "private": true,
@@ -10,5 +10,7 @@
     "test:logic": "node --test \"tests/*.test.js\"",
     "test": "python tests/validate_workflows.py && node --test \"tests/*.test.js\""
   },
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  }
 }

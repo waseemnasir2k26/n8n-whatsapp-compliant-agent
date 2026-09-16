@@ -2,6 +2,10 @@
 
 An n8n starter kit for a WhatsApp Business API AI agent where the compliance guardrails **are** the product: the 24-hour customer service window, opt-in and opt-out, send caps and a quality circuit breaker, all enforced in Postgres before a single message leaves your number.
 
+## Status
+
+Last reviewed: September 2026 · release v2026.09
+
 ## The ban problem
 
 Almost every WhatsApp automation tutorial shows you how to send a message. Almost none of them stop you from sending the message that gets your number blocked.
