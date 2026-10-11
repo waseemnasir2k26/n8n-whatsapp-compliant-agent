@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [2026.10] - 2026-10-12
+
+- October 2026 review of n8n-whatsapp-compliant-agent, a public MIT n8n starter kit for a WhatsApp Business API AI agent with five Postgres-backed compliance gates (24-hour window, opt-in/out, rate limits, quality circuit breaker) and a worked example agent.
+- Status: v1 from September 2026; package version bumped 1.1.0 to 1.2.0, documentation and metadata only. No workflow JSON, gate logic, SQL or tests changed.
+- Reviewed this month: all six Meta developer documentation links the README cites, plus Calendly and skynetjoe.com, still resolve. The cited policy rules were not re-read against Meta's current text in this pass, so the stated verification date stands. A Work with SkynetLabs section was added.
+- Known gaps (from the README Limitations): no guarantee against bans; cited rules will go stale; quality monitoring depends on webhook delivery; gates assume a single sender and database; example-agent has no tools, escalation or PII redaction. No CI workflow, so tests run only by hand.
+
 ## [2026.09] - 2026-09-16
 
 - Maintenance review of n8n-whatsapp-compliant-agent — an n8n starter kit for a WhatsApp Business API AI agent in which the compliance guardrails are the product: the 24-hour customer service window, opt-in/opt-out, send caps and a quality circuit breaker, all enforced in Postgres before a message leaves the number.
