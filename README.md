@@ -182,6 +182,6 @@ MIT - see [LICENSE](LICENSE). Copyright (c) 2026 Waseem Nasir / SkynetLabs.
 
 ---
 
-Built by SkynetLabs. Contact: info@skynetjoe.com
+Built by SkynetLabs. Contact: waseem@skynetjoe.com
 
 Need this wired into your business? SkynetLabs builds voice agents, n8n back offices and sites that convert → https://skynetjoe.com
